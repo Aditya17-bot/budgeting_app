@@ -2,19 +2,27 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from parser import process_sms_dataframe
+from parser import process_sms_dataframe, load_sms_xml
 from budget import daily_totals, weekly_totals, check_budget_limits
 
 st.set_page_config(page_title="SMS Budgeting", layout="wide")
 
 st.title("SMS Expense Tracking and Budgeting")
 
-uploaded_file = st.file_uploader("Upload SMS CSV", type=["csv"])
+uploaded_file = st.file_uploader("Upload SMS CSV or XML", type=["csv", "xml"])
 
 if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    st.subheader("CSV Preview")
-    st.dataframe(df.head(20))
+    filename = (uploaded_file.name or "").lower()
+    is_xml = filename.endswith(".xml")
+
+    if is_xml:
+        df = load_sms_xml(uploaded_file)
+        st.subheader("XML Preview")
+        st.dataframe(df.head(20))
+    else:
+        df = pd.read_csv(uploaded_file)
+        st.subheader("CSV Preview")
+        st.dataframe(df.head(20))
 
     columns = list(df.columns)
 
@@ -26,11 +34,14 @@ if uploaded_file:
         return ""
 
     message_default = guess_column(["content", "body", "message", "sms", "text"])
-    date_default = guess_column(["date", "datetime", "timestamp", "time", "sent", "received"])
-    sender_default = guess_column(["name/number sender", "sender", "from", "address", "name"])
+    if is_xml:
+        date_default = guess_column(["readable_date", "date", "datetime", "timestamp", "time", "sent", "received"])
+    else:
+        date_default = guess_column(["date", "datetime", "timestamp", "time", "sent", "received"])
+    sender_default = guess_column(["name/number sender", "sender", "from", "address", "name", "contact_name"])
 
     if not columns:
-        st.error("No columns detected in CSV.")
+        st.error("No columns detected in file.")
         st.stop()
 
     message_index = columns.index(message_default) if message_default in columns else 0

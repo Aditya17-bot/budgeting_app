@@ -1,6 +1,6 @@
 ﻿# SMS Budgeting App
 
-A privacy-friendly SMS expense tracker that processes exported SMS backups (CSV), extracts transactions, categorizes them, and visualizes spending with Streamlit.
+A privacy-friendly SMS expense tracker that processes exported SMS backups (CSV or XML), extracts transactions, categorizes them, and visualizes spending with Streamlit.
 
 ## What You Get
 - Rule-based SMS parsing (no cloud upload).
@@ -28,8 +28,16 @@ You can choose the columns in the Streamlit UI.
 
 ### Example Header
 ```
-date,body,address
+Type,Date,Name/Number Sender,Content
 ```
+
+## XML Support
+The app supports SMS Backup & Restore XML exports. It auto-loads the common fields:
+- `body` (message)
+- `date` or `readable_date`
+- `address` / `contact_name` for sender
+
+It also reads `mms` entries when present and extracts text from MMS parts.
 
 ## Output
 The app generates a processed table and lets you download a CSV.

@@ -1,4 +1,5 @@
 ﻿import re
+import xml.etree.ElementTree as ET
 import pandas as pd
 
 from classifier import classify_transaction_type, classify_category
@@ -106,3 +107,62 @@ def process_sms_dataframe(
     if not result.empty:
         result["date"] = coerce_datetime(result["date"])
     return result
+
+
+def _extract_mms_text(mms_elem) -> str:
+    parts = mms_elem.findall("./parts/part")
+    text_parts = []
+    for part in parts:
+        content_type = (part.attrib.get("ct") or "").lower()
+        if content_type.startswith("text/"):
+            text = part.attrib.get("text") or ""
+            if text:
+                text_parts.append(text)
+    if text_parts:
+        return " ".join(text_parts).strip()
+    return (mms_elem.attrib.get("sub") or "").strip()
+
+
+def _extract_mms_sender(mms_elem) -> str:
+    for addr in mms_elem.findall("./addrs/addr"):
+        addr_type = addr.attrib.get("type")
+        if addr_type == "137":
+            return addr.attrib.get("address") or ""
+    first = mms_elem.find("./addrs/addr")
+    if first is not None:
+        return first.attrib.get("address") or ""
+    return mms_elem.attrib.get("address") or ""
+
+
+def load_sms_xml(file_like) -> pd.DataFrame:
+    tree = ET.parse(file_like)
+    root = tree.getroot()
+    rows = []
+
+    for sms in root.findall("sms"):
+        rows.append(
+            {
+                "date": sms.attrib.get("date"),
+                "readable_date": sms.attrib.get("readable_date"),
+                "address": sms.attrib.get("address"),
+                "contact_name": sms.attrib.get("contact_name"),
+                "body": sms.attrib.get("body"),
+                "type": sms.attrib.get("type"),
+                "kind": "sms",
+            }
+        )
+
+    for mms in root.findall("mms"):
+        rows.append(
+            {
+                "date": mms.attrib.get("date"),
+                "readable_date": mms.attrib.get("readable_date"),
+                "address": _extract_mms_sender(mms),
+                "contact_name": mms.attrib.get("contact_name"),
+                "body": _extract_mms_text(mms),
+                "type": mms.attrib.get("msg_box") or mms.attrib.get("type"),
+                "kind": "mms",
+            }
+        )
+
+    return pd.DataFrame(rows)
