@@ -1,8 +1,16 @@
 ﻿import pandas as pd
 
 
+def _ensure_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    return out
+
+
 def daily_totals(df: pd.DataFrame) -> pd.DataFrame:
-    expenses = df[df["transaction_type"] == "Expense"].copy()
+    expenses = _ensure_datetime(df)
+    expenses = expenses[expenses["transaction_type"] == "Expense"].copy()
     expenses = expenses.dropna(subset=["date"])
     expenses["date_only"] = expenses["date"].dt.date
     totals = (
@@ -12,25 +20,51 @@ def daily_totals(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def weekly_totals(df: pd.DataFrame) -> pd.DataFrame:
-    expenses = df[df["transaction_type"] == "Expense"].copy()
+    expenses = _ensure_datetime(df)
+    expenses = expenses[expenses["transaction_type"] == "Expense"].copy()
     expenses = expenses.dropna(subset=["date"])
     expenses["week_start"] = expenses["date"].dt.to_period("W-MON").apply(lambda p: p.start_time.date())
     totals = expenses.groupby("week_start")["amount"].sum().reset_index()
     return totals
 
 
-def check_budget_limits(daily_df: pd.DataFrame, weekly_df: pd.DataFrame, daily_limit: float, weekly_limit: float):
-    daily_exceeded = None
-    weekly_exceeded = None
+def monthly_totals(df: pd.DataFrame) -> pd.DataFrame:
+    expenses = _ensure_datetime(df)
+    expenses = expenses[expenses["transaction_type"] == "Expense"].copy()
+    expenses = expenses.dropna(subset=["date"])
+    expenses["month_start"] = expenses["date"].dt.to_period("M").apply(lambda p: p.start_time.date())
+    totals = expenses.groupby("month_start")["amount"].sum().reset_index()
+    return totals
 
-    if daily_limit and not daily_df.empty:
-        max_daily = daily_df["amount"].max()
-        if max_daily > daily_limit:
-            daily_exceeded = max_daily
 
-    if weekly_limit and not weekly_df.empty:
-        max_weekly = weekly_df["amount"].max()
-        if max_weekly > weekly_limit:
-            weekly_exceeded = max_weekly
+def current_period_status(
+    df: pd.DataFrame,
+    daily_limit: float,
+    weekly_limit: float,
+    monthly_limit: float,
+) -> dict:
+    expenses = _ensure_datetime(df)
+    expenses = expenses[expenses["transaction_type"] == "Expense"].copy()
+    expenses = expenses.dropna(subset=["date"])
 
-    return daily_exceeded, weekly_exceeded
+    today = pd.Timestamp.today().normalize()
+    week_start = (today - pd.Timedelta(days=today.weekday())).date()
+    month_start = today.replace(day=1).date()
+
+    day_total = expenses[expenses["date"].dt.date == today.date()]["amount"].sum()
+    week_total = expenses[expenses["date"].dt.date >= week_start]["amount"].sum()
+    month_total = expenses[expenses["date"].dt.date >= month_start]["amount"].sum()
+
+    def remaining(limit, total):
+        if not limit:
+            return None
+        return limit - total
+
+    return {
+        "day_total": day_total,
+        "week_total": week_total,
+        "month_total": month_total,
+        "day_remaining": remaining(daily_limit, day_total),
+        "week_remaining": remaining(weekly_limit, week_total),
+        "month_remaining": remaining(monthly_limit, month_total),
+    }

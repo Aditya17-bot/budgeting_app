@@ -1,0 +1,28 @@
+{
+  "name": "SMS Budget Tracker",
+  "short_name": "Budget Tracker",
+  "description": "Track expenses from SMS data with beautiful analytics and budget management",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#667eea",
+  "theme_color": "#667eea",
+  "orientation": "portrait-primary",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "https://via.placeholder.com/192x192.png?text=💰",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://via.placeholder.com/512x512.png?text=💰",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["finance", "productivity", "utilities"],
+  "lang": "en-US",
+  "dir": "ltr"
+}
