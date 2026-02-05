@@ -1,10 +1,9 @@
 const CACHE_NAME = 'sms-budget-tracker-v1';
 const urlsToCache = [
   '/',
-  '/index.html',
-  '/manifest.json',
-  'https://via.placeholder.com/192x192.png?text=💰',
-  'https://via.placeholder.com/512x512.png?text=💰'
+  '/static/js/main.js',
+  '/static/css/main.css',
+  '/manifest.json'
 ];
 
 // Install a service worker

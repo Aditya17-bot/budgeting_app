@@ -16,11 +16,11 @@ from mobile_utils import add_pwa_meta, mobile_friendly_layout
 # Initialize database
 db = DataPersistence()
 
-# Configure page
+# Streamlit page configuration
 st.set_page_config(
-    page_title="💰 SMS Budget Tracker", 
+    page_title="SMS Budget Tracker",
+    page_icon="💰",
     layout="wide",
-    page_icon="💳",
     initial_sidebar_state="expanded"
 )
 

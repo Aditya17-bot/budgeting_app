@@ -20,16 +20,17 @@ def set_png_as_page_bg(png_file):
     st.markdown(page_bg_img, unsafe_allow_html=True)
 
 def add_pwa_meta():
-    pwa_meta = '''
-    <link rel="manifest" href="manifest.json">
-    <meta name="theme-color" content="#667eea">
+    """Add PWA meta tags to Streamlit app"""
+    st.markdown("""
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
-    <meta name="apple-mobile-web-app-title" content="Budget Tracker">
-    <link rel="apple-touch-icon" href="icon-192.png">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    '''
-    st.markdown(pwa_meta, unsafe_allow_html=True)
+    <meta name="apple-mobile-web-app-title" content="SMS Budget Tracker">
+    <meta name="application-name" content="SMS Budget Tracker">
+    <meta name="msapplication-TileColor" content="#6366f1">
+    <meta name="theme-color" content="#6366f1">
+    <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💰</text></svg>">
+    <link rel="manifest" href="/manifest.json">
+    """, unsafe_allow_html=True)
 
 def mobile_friendly_layout():
     # Mobile-specific CSS
