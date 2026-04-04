@@ -1,4 +1,4 @@
-﻿streamlit
+streamlit
 pandas
 matplotlib
 plotly
@@ -6,3 +6,6 @@ numpy
 fastapi
 uvicorn
 python-multipart
+spacy>=3.7,<3.8
+joblib
+scikit-learn
