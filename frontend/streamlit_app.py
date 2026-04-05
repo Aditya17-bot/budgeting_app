@@ -300,6 +300,98 @@ def _anomaly_card(row: pd.Series) -> str:
 </div>"""
 
 
+def _default_budget_limits() -> dict:
+    saved = db.get_budgets()
+    return {
+        "daily": float(saved.get("daily", 500.0) or 500.0),
+        "weekly": float(saved.get("weekly", 3500.0) or 3500.0),
+        "monthly": float(saved.get("monthly", 15000.0) or 15000.0),
+    }
+
+
+def _init_session_state() -> None:
+    st.session_state.setdefault("processed_data", None)
+    st.session_state.setdefault("budget_limits", _default_budget_limits())
+    st.session_state.setdefault("analysis_ready", False)
+    st.session_state.setdefault("analysis_error", None)
+    st.session_state.setdefault("analysis_source_name", "")
+    st.session_state.setdefault(
+        "txn_filters",
+        {"category": "All", "type": "All", "merchant": "", "sort_by": "date"},
+    )
+
+
+def _normalize_processed_frame(df: pd.DataFrame) -> pd.DataFrame:
+    expected = ["date", "amount", "transaction_type", "category", "merchant", "original_message"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=expected)
+
+    out = df.copy()
+    for col in expected:
+        if col not in out.columns:
+            out[col] = "" if col in {"transaction_type", "category", "merchant", "original_message"} else pd.NA
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["amount"] = pd.to_numeric(out["amount"], errors="coerce")
+    out["transaction_type"] = out["transaction_type"].fillna("").astype(str)
+    out["category"] = out["category"].fillna("Other").astype(str)
+    out["merchant"] = out["merchant"].fillna("").astype(str)
+    out["original_message"] = out["original_message"].fillna("").astype(str)
+
+    out = out.dropna(subset=["date", "amount"]).reset_index(drop=True)
+    return out[expected]
+
+
+@st.cache_data(show_spinner=False)
+def _compute_dashboard_data(
+    processed: pd.DataFrame,
+    daily_limit: float,
+    weekly_limit: float,
+    monthly_limit: float,
+) -> dict:
+    expenses_df = processed[processed["transaction_type"] == "Expense"].copy()
+    income_df = processed[processed["transaction_type"] == "Income"].copy()
+
+    total_expense = float(expenses_df["amount"].sum()) if not expenses_df.empty else 0.0
+    total_income = float(income_df["amount"].sum()) if not income_df.empty else 0.0
+    avg_txn = float(processed["amount"].mean()) if not processed.empty else 0.0
+    net = total_income - total_expense
+
+    status = current_period_status(processed, daily_limit, weekly_limit, monthly_limit)
+    avg_daily = average_daily_spend(processed)
+    forecast_df = predict_next_7_days_spend(processed)
+    anomalies_df = detect_anomalies(processed)
+    health = calculate_financial_health_score(
+        processed,
+        {"daily": daily_limit, "weekly": weekly_limit, "monthly": monthly_limit},
+        status,
+    )
+    overrun_forecasts = build_budget_overrun_forecasts(
+        status,
+        {"daily": daily_limit, "weekly": weekly_limit, "monthly": monthly_limit},
+        avg_daily,
+    )
+
+    return {
+        "expenses_df": expenses_df,
+        "income_df": income_df,
+        "total_expense": total_expense,
+        "total_income": total_income,
+        "avg_txn": avg_txn,
+        "net": net,
+        "status": status,
+        "avg_daily": avg_daily,
+        "forecast_df": forecast_df,
+        "anomalies_df": anomalies_df,
+        "health": health,
+        "overrun_forecasts": overrun_forecasts,
+        "daily_df": daily_totals(processed),
+        "weekly_df": weekly_totals(processed),
+        "monthly_df": monthly_totals(processed),
+        "full_daily": daily_spending_series(processed),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Masthead
 # ---------------------------------------------------------------------------
@@ -310,6 +402,8 @@ st.markdown("""
     <div class="rr-tagline">SMS · Finance · Intelligence</div>
 </div>
 """, unsafe_allow_html=True)
+
+_init_session_state()
 
 # ---------------------------------------------------------------------------
 # Upload
@@ -322,7 +416,7 @@ with up1:
     uploaded_file = st.file_uploader("Drop SMS export here", type=["csv", "xml"], label_visibility="collapsed")
 with up2:
     st.write(""); st.write("")
-    if st.button("↺  Clear session", use_container_width=True):
+    if st.button("↺  Clear session", width="stretch"):
         st.session_state.clear()
         st.rerun()
 with up3:
@@ -354,7 +448,7 @@ if uploaded_file:
     }.items()))
 
     with st.expander("Preview raw data (first 10 rows)", expanded=False):
-        st.dataframe(df.head(10), use_container_width=True, height=280)
+        st.dataframe(df.head(10), width="stretch", height=280)
 
     if not message_col or not date_col:
         st.error("Auto-detection failed for message or date columns.")
@@ -362,98 +456,160 @@ if uploaded_file:
 
     # ── Sidebar ─────────────────────────────────────────────────────────
     st.sidebar.markdown("## Configuration")
-    saved_budgets = db.get_budgets()
+    current_limits = st.session_state["budget_limits"]
 
     with st.sidebar.expander("Budget limits", expanded=True):
-        daily_limit   = st.number_input("Daily",   min_value=0.0, value=saved_budgets.get("daily",   500.0),   step=50.0)
-        weekly_limit  = st.number_input("Weekly",  min_value=0.0, value=saved_budgets.get("weekly",  3500.0),  step=200.0)
-        monthly_limit = st.number_input("Monthly", min_value=0.0, value=saved_budgets.get("monthly", 15000.0), step=500.0)
-        if st.button("Save limits", use_container_width=True):
-            db.save_budget("default", "daily",   daily_limit)
-            db.save_budget("default", "weekly",  weekly_limit)
-            db.save_budget("default", "monthly", monthly_limit)
-            st.success("Saved.")
+        with st.form("budget_limits_form", clear_on_submit=False):
+            daily_limit = st.number_input("Daily", min_value=0.0, value=float(current_limits["daily"]), step=50.0)
+            weekly_limit = st.number_input("Weekly", min_value=0.0, value=float(current_limits["weekly"]), step=200.0)
+            monthly_limit = st.number_input("Monthly", min_value=0.0, value=float(current_limits["monthly"]), step=500.0)
+            save_limits = st.form_submit_button("Save limits", width="stretch")
+
+        if save_limits:
+            try:
+                db.save_budget("default", "daily", daily_limit)
+                db.save_budget("default", "weekly", weekly_limit)
+                db.save_budget("default", "monthly", monthly_limit)
+                st.session_state["budget_limits"] = {
+                    "daily": float(daily_limit),
+                    "weekly": float(weekly_limit),
+                    "monthly": float(monthly_limit),
+                }
+                st.sidebar.success("Saved.")
+            except Exception as exc:
+                st.sidebar.error(f"Budget save failed: {exc}")
+
+    analysis_defaults = st.session_state.get(
+        "analysis_filters",
+        {
+            "min_amount": 0.0,
+            "show_income": True,
+            "debug_mode": False,
+            "date_range": [datetime(2025, 1, 1).date(), datetime.now().date()],
+        },
+    )
 
     with st.sidebar.expander("Analysis options"):
-        min_amount  = st.number_input("Min transaction (₹)", min_value=0.0, value=0.0, step=10.0)
-        show_income = st.checkbox("Include income", value=True)
-        debug_mode  = st.checkbox("Debug classification", value=False)
-        date_range  = st.date_input("Date window", value=[datetime(2025, 1, 1).date(), datetime.now().date()])
+        min_amount = st.number_input(
+            "Min transaction (₹)",
+            min_value=0.0,
+            value=float(analysis_defaults["min_amount"]),
+            step=10.0,
+        )
+        show_income = st.checkbox("Include income", value=bool(analysis_defaults["show_income"]))
+        debug_mode = st.checkbox("Debug classification", value=bool(analysis_defaults["debug_mode"]))
+        date_range = st.date_input("Date window", value=analysis_defaults["date_range"])
 
     # ── Process ──────────────────────────────────────────────────────────
     st.markdown('<div class="section-label">03 — Processing</div>', unsafe_allow_html=True)
     _, btn_col, _ = st.columns([1, 2, 1])
     with btn_col:
-        run = st.button("◈  Analyse SMS Data", use_container_width=True, type="primary")
+        run = st.button("◈  Analyse SMS Data", width="stretch", type="primary")
 
     if run:
-        with st.spinner("Parsing transactions…"):
-            processed = process_sms_dataframe(df, message_col, date_col, sender_col or None)
-
-        if processed.empty:
-            st.warning("No financial SMS messages found.")
-            st.stop()
-
-        processed = (
-            processed
-            .dropna(subset=["date"])
-            .loc[lambda d: d["date"] >= pd.Timestamp(date_range[0])]
-            .loc[lambda d: d["date"] <= pd.Timestamp(date_range[1])]
-            .loc[lambda d: d["amount"] >= min_amount]
-        )
-        if not show_income:
-            processed = processed[processed["transaction_type"] == "Expense"]
-
-        if processed.empty:
-            st.warning("No transactions remain after applying filters.")
-            st.stop()
-
-        st.success(f"Extracted {len(processed):,} transactions.")
-
-        if debug_mode:
-            st.markdown('<div class="section-label">Debug — classification sample</div>', unsafe_allow_html=True)
-            for _, row in processed.head(10).iterrows():
-                with st.expander(f"{_rupee(row['amount'])}  ·  {row['transaction_type']}  ·  {row['category']}"):
-                    st.text(row["original_message"])
-
         try:
-            saved_count = db.save_transactions(processed)
-            st.caption(f"Persisted {len(processed):,} transactions (total in DB: {saved_count:,})")
-        except Exception as exc:
-            st.warning(f"DB write failed — {exc}")
+            if not isinstance(date_range, (list, tuple)) or len(date_range) != 2:
+                raise ValueError("Please select both a start and end date before analysis.")
 
-        st.session_state.processed_data = processed
-        st.session_state.budget_limits  = {
-            "daily": daily_limit, "weekly": weekly_limit, "monthly": monthly_limit,
-        }
+            with st.spinner("Parsing transactions..."):
+                processed = process_sms_dataframe(df, message_col, date_col, sender_col or None)
+
+            processed = _normalize_processed_frame(processed)
+            if processed.empty:
+                raise ValueError("No financial SMS messages were detected in the uploaded file.")
+
+            start_date = pd.Timestamp(date_range[0])
+            end_date = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+            processed = (
+                processed
+                .loc[lambda d: d["date"] >= start_date]
+                .loc[lambda d: d["date"] <= end_date]
+                .loc[lambda d: d["amount"] >= float(min_amount)]
+            )
+            if not show_income:
+                processed = processed[processed["transaction_type"] == "Expense"]
+
+            processed = _normalize_processed_frame(processed)
+            if processed.empty:
+                raise ValueError("No transactions remain after applying the selected analysis filters.")
+
+            st.session_state["processed_data"] = processed
+            st.session_state["analysis_ready"] = True
+            st.session_state["analysis_error"] = None
+            st.session_state["analysis_source_name"] = uploaded_file.name or ""
+            st.session_state["analysis_filters"] = {
+                "min_amount": float(min_amount),
+                "show_income": bool(show_income),
+                "debug_mode": bool(debug_mode),
+                "date_range": [date_range[0], date_range[1]],
+            }
+
+            st.success(f"Extracted {len(processed):,} transactions.")
+
+            if debug_mode:
+                st.markdown('<div class="section-label">Debug — classification sample</div>', unsafe_allow_html=True)
+                for _, row in processed.head(10).iterrows():
+                    with st.expander(f"{_rupee(row['amount'])}  ·  {row['transaction_type']}  ·  {row['category']}"):
+                        st.text(row["original_message"])
+
+            try:
+                saved_count = db.save_transactions(processed)
+                st.caption(f"Persisted {len(processed):,} transactions (total in DB: {saved_count:,})")
+            except Exception as exc:
+                st.warning(f"DB write failed — {exc}")
+        except Exception as exc:
+            st.session_state["analysis_ready"] = False
+            st.session_state["analysis_error"] = str(exc)
+            st.error(str(exc))
 
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
 
-if "processed_data" not in st.session_state:
+processed = st.session_state.get("processed_data")
+limits = st.session_state.get("budget_limits", _default_budget_limits())
+
+if processed is None or processed.empty:
+    if st.session_state.get("analysis_error"):
+        st.info("Fix the analysis issue above and run the analysis again.")
+    elif uploaded_file:
+        st.info("Upload detected. Click `Analyse SMS Data` to build the dashboard.")
+    else:
+        st.info("Upload an SMS export and run analysis to open the dashboard.")
     st.stop()
 
-processed = st.session_state.processed_data
-limits    = st.session_state.budget_limits
+processed = _normalize_processed_frame(processed)
+st.session_state["processed_data"] = processed
 
-expenses_df   = processed[processed["transaction_type"] == "Expense"]
-income_df     = processed[processed["transaction_type"] == "Income"]
-total_expense = expenses_df["amount"].sum()
-total_income  = income_df["amount"].sum()
-avg_txn       = processed["amount"].mean()
-net           = total_income - total_expense
+try:
+    dashboard = _compute_dashboard_data(
+        processed,
+        float(limits["daily"]),
+        float(limits["weekly"]),
+        float(limits["monthly"]),
+    )
+except Exception as exc:
+    st.error("Dashboard rendering failed.")
+    st.exception(exc)
+    st.stop()
 
-status            = current_period_status(processed, limits["daily"], limits["weekly"], limits["monthly"])
-avg_daily         = average_daily_spend(processed)
-forecast_df       = predict_next_7_days_spend(processed)
-anomalies_df      = detect_anomalies(processed)
-health            = calculate_financial_health_score(processed, limits, status)
-overrun_forecasts = build_budget_overrun_forecasts(status, limits, avg_daily)
-daily_df          = daily_totals(processed)
-weekly_df         = weekly_totals(processed)
-monthly_df        = monthly_totals(processed)
-full_daily        = daily_spending_series(processed)
+expenses_df = dashboard["expenses_df"]
+income_df = dashboard["income_df"]
+total_expense = dashboard["total_expense"]
+total_income = dashboard["total_income"]
+avg_txn = dashboard["avg_txn"]
+net = dashboard["net"]
+status = dashboard["status"]
+avg_daily = dashboard["avg_daily"]
+forecast_df = dashboard["forecast_df"]
+anomalies_df = dashboard["anomalies_df"]
+health = dashboard["health"]
+overrun_forecasts = dashboard["overrun_forecasts"]
+daily_df = dashboard["daily_df"]
+weekly_df = dashboard["weekly_df"]
+monthly_df = dashboard["monthly_df"]
+full_daily = dashboard["full_daily"]
 
 st.markdown('<div class="section-label">04 — Dashboard</div>', unsafe_allow_html=True)
 
@@ -472,15 +628,54 @@ tab_txn, tab_analytics, tab_budget, tab_cat, tab_export = st.tabs([
 # ============================================================ TRANSACTIONS
 with tab_txn:
     st.markdown('<div class="section-label">Transaction ledger</div>', unsafe_allow_html=True)
+    filter_defaults = st.session_state["txn_filters"]
+    category_options = ["All"] + sorted(processed["category"].dropna().unique().tolist())
+    type_options = ["All", "Expense", "Income"]
+    sort_options = ["date", "amount", "category"]
+
+    if filter_defaults["category"] not in category_options:
+        filter_defaults["category"] = "All"
+    if filter_defaults["type"] not in type_options:
+        filter_defaults["type"] = "All"
+    if filter_defaults["sort_by"] not in sort_options:
+        filter_defaults["sort_by"] = "date"
+
     f1, f2, f3, f4 = st.columns(4)
     with f1:
-        cat_filter = st.selectbox("Category", ["All"] + sorted(processed["category"].dropna().unique().tolist()))
+        cat_filter = st.selectbox(
+            "Category",
+            category_options,
+            index=category_options.index(filter_defaults["category"]),
+            key="txn_filter_category",
+        )
     with f2:
-        type_filter = st.selectbox("Type", ["All", "Expense", "Income"])
+        type_filter = st.selectbox(
+            "Type",
+            type_options,
+            index=type_options.index(filter_defaults["type"]),
+            key="txn_filter_type",
+        )
     with f3:
-        merchant_q = st.text_input("Merchant search", placeholder="e.g. Swiggy")
+        merchant_q = st.text_input(
+            "Merchant search",
+            value=filter_defaults["merchant"],
+            placeholder="e.g. Swiggy",
+            key="txn_filter_merchant",
+        )
     with f4:
-        sort_by = st.selectbox("Sort by", ["date", "amount", "category"])
+        sort_by = st.selectbox(
+            "Sort by",
+            sort_options,
+            index=sort_options.index(filter_defaults["sort_by"]),
+            key="txn_filter_sort_by",
+        )
+
+    st.session_state["txn_filters"] = {
+        "category": cat_filter,
+        "type": type_filter,
+        "merchant": merchant_q,
+        "sort_by": sort_by,
+    }
 
     view = processed.copy()
     if cat_filter != "All":
@@ -496,7 +691,7 @@ with tab_txn:
     st.caption(f"Showing {len(view):,} of {len(processed):,}  ·  Filtered expenses {_rupee(f_exp)}  ·  income {_rupee(f_inc)}")
     st.dataframe(
         view[["date", "amount", "transaction_type", "category", "merchant", "original_message"]],
-        use_container_width=True, height=460,
+        width="stretch", height=460,
     )
 
 # ============================================================ ANALYTICS
@@ -616,10 +811,11 @@ with tab_analytics:
 
         fc_disp = fc[["date", "predicted_amount", "lower", "upper"]].copy()
         fc_disp.columns = ["Date", "Predicted (₹)", "Low (₹)", "High (₹)"]
+        fc_disp["Date"] = pd.to_datetime(fc_disp["Date"], errors="coerce")
         fc_disp["Date"] = fc_disp["Date"].dt.strftime("%a %d %b")
         for col in ["Predicted (₹)", "Low (₹)", "High (₹)"]:
             fc_disp[col] = fc_disp[col].map(lambda x: f"₹{x:,.0f}")
-        st.dataframe(fc_disp, use_container_width=True, hide_index=True)
+        st.dataframe(fc_disp, width="stretch", hide_index=True)
         st.caption(
             "Weighted moving average (recent days weighted higher) blended with "
             "linear trend from last 14 days. Confidence band ±20%."
@@ -718,6 +914,8 @@ with tab_cat:
 
     st.markdown('<div class="section-label">Monthly trends by category</div>', unsafe_allow_html=True)
     trend_df = processed.copy()
+    trend_df["date"] = pd.to_datetime(trend_df["date"], errors="coerce")
+    trend_df = trend_df.dropna(subset=["date"])
     trend_df["month"] = trend_df["date"].dt.to_period("M").astype(str)
     monthly_cat = trend_df.groupby(["month", "category"])["amount"].sum().reset_index()
 
@@ -742,7 +940,7 @@ with tab_export:
         st.download_button(
             "↓  Download transactions.csv",
             data=processed.to_csv(index=False).encode("utf-8"),
-            file_name=f"transactions_{today_str}.csv", mime="text/csv", use_container_width=True,
+            file_name=f"transactions_{today_str}.csv", mime="text/csv", width="stretch",
         )
     with ex2:
         st.markdown("**Summary report**")
@@ -754,13 +952,17 @@ with tab_export:
         st.download_button(
             "↓  Download summary.csv",
             data=summary_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"summary_{today_str}.csv", mime="text/csv", use_container_width=True,
+            file_name=f"summary_{today_str}.csv", mime="text/csv", width="stretch",
         )
 
     st.markdown('<div class="section-label">Snapshot</div>', unsafe_allow_html=True)
+    snapshot_dates = pd.to_datetime(processed["date"], errors="coerce").dropna()
     st.json({
         "transactions":   len(processed),
-        "date_range":     {"from": processed["date"].min().strftime("%Y-%m-%d"), "to": processed["date"].max().strftime("%Y-%m-%d")},
+        "date_range":     {
+            "from": snapshot_dates.min().strftime("%Y-%m-%d") if not snapshot_dates.empty else None,
+            "to": snapshot_dates.max().strftime("%Y-%m-%d") if not snapshot_dates.empty else None,
+        },
         "total_expenses": round(total_expense, 2),
         "total_income":   round(total_income,  2),
         "net":            round(net, 2),

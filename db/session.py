@@ -2,21 +2,12 @@
 db/session.py
 -------------
 SQLite persistence layer for transactions, budgets, and custom categories.
-
-Public surface:
-    DataPersistence(db_path?)
-        .save_transactions(df, user_id?)   -> int
-        .get_transactions(user_id?, ...)   -> pd.DataFrame
-        .save_budget(user_id, period, amount)
-        .get_budgets(user_id?)             -> dict
-        .get_spending_summary(...)         -> dict
-        .export_to_csv(...)                -> str
-        .delete_user_data(user_id)
 """
 
 from __future__ import annotations
 
 import sqlite3
+import shutil
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +20,7 @@ class DataPersistence:
     def __init__(self, db_path: str = "") -> None:
         self.db_path = self._resolve_db_path(db_path)
         self._init_database()
+        self._migrate_budgets_table()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -38,17 +30,27 @@ class DataPersistence:
     def _resolve_db_path(db_path: str) -> str:
         if db_path:
             return db_path
-        base_dir  = Path(__file__).resolve().parents[1]
-        data_dir  = base_dir / "data"
+        base_dir = Path(__file__).resolve().parents[1]
+        data_dir = base_dir / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
         preferred = data_dir / "budget_data.db"
-        legacy    = base_dir / "budget_data.db"
-        return str(preferred if preferred.exists() or not legacy.exists() else legacy)
+        legacy = base_dir / "budget_data.db"
+        if not preferred.exists() and legacy.exists():
+            try:
+                shutil.copy2(legacy, preferred)
+            except OSError:
+                return str(legacy)
+        return str(preferred)
 
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
-        conn = sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn = sqlite3.connect(
+            self.db_path,
+            detect_types=sqlite3.PARSE_DECLTYPES,
+            timeout=5.0,
+        )
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
         try:
             yield conn
             conn.commit()
@@ -59,7 +61,7 @@ class DataPersistence:
             conn.close()
 
     def _init_database(self) -> None:
-        """Create tables and performance indexes. Safe to call on existing DBs."""
+        """Create tables and indexes. Safe to call on existing DBs."""
         with self._connect() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS transactions (
@@ -94,8 +96,6 @@ class DataPersistence:
                     created_at    TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            # Query-speed indexes only — no unique constraint on transactions.
-            # Deduplication is handled in Python inside save_transactions().
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_transactions_user_date
                 ON transactions (user_id, date)
@@ -105,29 +105,44 @@ class DataPersistence:
                 ON transactions (user_id, category)
             """)
 
+    def _migrate_budgets_table(self) -> None:
+        """Ensure budgets can be upserted on ``(user_id, period)`` safely."""
+        with self._connect() as conn:
+            existing_indexes = conn.execute("PRAGMA index_list('budgets')").fetchall()
+            for row in existing_indexes:
+                if row["unique"] and row["name"] == "idx_budgets_user_period_unique":
+                    return
+
+            conn.execute("""
+                DELETE FROM budgets
+                WHERE id NOT IN (
+                    SELECT MAX(id)
+                    FROM budgets
+                    GROUP BY user_id, period
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_user_period_unique
+                ON budgets (user_id, period)
+            """)
+
     # ------------------------------------------------------------------
     # Transactions
     # ------------------------------------------------------------------
 
     def save_transactions(self, df: pd.DataFrame, user_id: str = "default") -> int:
-        """
-        Persist new rows from *df*, skipping any that are already stored
-        (matched on user_id + original_message + date + amount).
-
-        Deduplication is done in Python so it works regardless of SQLite
-        version and is immune to index state on existing databases.
+        """Persist new rows, skipping duplicates on (user_id, message, date, amount).
 
         Returns the total row count for *user_id* after the insert.
         """
         if df.empty:
             return self._count_transactions(user_id)
 
-        required  = ["date", "amount", "transaction_type", "category",
-                     "merchant", "original_message"]
+        required = ["date", "amount", "transaction_type", "category", "merchant", "original_message"]
         available = [c for c in required if c in df.columns]
 
         insert_df = df[available].copy()
-        insert_df["user_id"]    = user_id
+        insert_df["user_id"] = user_id
         insert_df["created_at"] = datetime.now().isoformat()
 
         if "date" in insert_df.columns:
@@ -136,16 +151,9 @@ class DataPersistence:
                 .dt.strftime("%Y-%m-%d %H:%M:%S")
             )
 
-        # ── Python-side deduplication ─────────────────────────────────
-        # Fetch the fingerprints (message + date + amount) already in the DB
-        # for this user, then drop any incoming rows that match.
         with self._connect() as conn:
             existing = pd.read_sql_query(
-                """
-                SELECT original_message, date, amount
-                FROM   transactions
-                WHERE  user_id = ? AND original_message IS NOT NULL
-                """,
+                "SELECT original_message, date, amount FROM transactions WHERE user_id = ? AND original_message IS NOT NULL",
                 conn,
                 params=(user_id,),
             )
@@ -157,7 +165,6 @@ class DataPersistence:
                 + "|" + existing["amount"].astype(str)
             )
             existing_keys = set(existing["_key"])
-
             mask = ~(
                 insert_df["original_message"].astype(str)
                 + "|" + insert_df["date"].astype(str)
@@ -168,11 +175,11 @@ class DataPersistence:
         if insert_df.empty:
             return self._count_transactions(user_id)
 
-        records      = insert_df.to_dict("records")
-        col_names    = list(records[0].keys())
+        records = insert_df.to_dict("records")
+        col_names = list(records[0].keys())
         placeholders = ", ".join("?" * len(col_names))
-        col_list     = ", ".join(col_names)
-        sql          = f"INSERT INTO transactions ({col_list}) VALUES ({placeholders})"
+        col_list = ", ".join(col_names)
+        sql = f"INSERT INTO transactions ({col_list}) VALUES ({placeholders})"
 
         with self._connect() as conn:
             conn.executemany(sql, [tuple(r[c] for c in col_names) for r in records])
@@ -198,7 +205,7 @@ class DataPersistence:
     ) -> pd.DataFrame:
         """Return transactions for *user_id* as a DataFrame, newest first."""
         conditions: List[str] = ["user_id = ?"]
-        params:     List[Any] = [user_id]
+        params: List[Any] = [user_id]
 
         if start_date:
             conditions.append("date >= ?")
@@ -262,31 +269,25 @@ class DataPersistence:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Return high-level spending statistics for *user_id*."""
         df = self.get_transactions(user_id, start_date, end_date)
-
         if df.empty:
             return {
                 "total_transactions": 0,
-                "total_expenses":     0.0,
-                "total_income":       0.0,
-                "avg_transaction":    0.0,
-                "categories":         [],
-                "date_range":         None,
+                "total_expenses": 0.0,
+                "total_income": 0.0,
+                "avg_transaction": 0.0,
+                "categories": [],
+                "date_range": None,
             }
-
-        expenses = float(df[df["transaction_type"] == "Expense"]["amount"].sum())
-        income   = float(df[df["transaction_type"] == "Income"]["amount"].sum())
-
         return {
             "total_transactions": len(df),
-            "total_expenses":     expenses,
-            "total_income":       income,
-            "avg_transaction":    float(df["amount"].mean()),
-            "categories":         sorted(df["category"].dropna().unique().tolist()),
+            "total_expenses": float(df[df["transaction_type"] == "Expense"]["amount"].sum()),
+            "total_income": float(df[df["transaction_type"] == "Income"]["amount"].sum()),
+            "avg_transaction": float(df["amount"].mean()),
+            "categories": sorted(df["category"].dropna().unique().tolist()),
             "date_range": {
                 "start": df["date"].min().strftime("%Y-%m-%d"),
-                "end":   df["date"].max().strftime("%Y-%m-%d"),
+                "end": df["date"].max().strftime("%Y-%m-%d"),
             },
         }
 
@@ -296,7 +297,6 @@ class DataPersistence:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
     ) -> str:
-        """Return transactions as a CSV string."""
         return self.get_transactions(user_id, start_date, end_date).to_csv(index=False)
 
     # ------------------------------------------------------------------
